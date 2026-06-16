@@ -3,9 +3,9 @@ import io
 import json
 import mimetypes
 from datetime import datetime
+from urllib.parse import urlparse
 
-import psycopg2
-import psycopg2.extras
+import pg8000.dbapi
 from flask import Flask, render_template, request, redirect, url_for, g, flash, send_file, abort
 
 from parsing import (
@@ -21,13 +21,40 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "screen-genie-internal-dev-key")
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024  # 60 MB
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+def parse_db_url(url):
+    r = urlparse(url)
+    return {
+        "host": r.hostname,
+        "port": r.port or 5432,
+        "database": r.path.lstrip("/"),
+        "user": r.username,
+        "password": r.password,
+    }
 
 
 def get_db():
     if "db" not in g:
-        g.db = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        p = parse_db_url(DATABASE_URL)
+        g.db = pg8000.dbapi.connect(
+            host=p["host"], port=p["port"], database=p["database"],
+            user=p["user"], password=p["password"], ssl_context=True,
+        )
+        g.db.autocommit = False
     return g.db
+
+
+def fetchall_dict(cursor):
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def fetchone_dict(cursor):
+    cols = [d[0] for d in cursor.description]
+    row = cursor.fetchone()
+    return dict(zip(cols, row)) if row else None
 
 
 @app.teardown_appcontext
@@ -38,7 +65,11 @@ def close_db(exception=None):
 
 
 def init_db():
-    db = psycopg2.connect(DATABASE_URL)
+    p = parse_db_url(DATABASE_URL)
+    db = pg8000.dbapi.connect(
+        host=p["host"], port=p["port"], database=p["database"],
+        user=p["user"], password=p["password"], ssl_context=True,
+    )
     cur = db.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scans (
@@ -49,8 +80,9 @@ def init_db():
             resume_count INTEGER NOT NULL,
             avg_score REAL NOT NULL,
             created_at TEXT NOT NULL
-        );
-
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS candidates (
             id SERIAL PRIMARY KEY,
             scan_id INTEGER NOT NULL,
@@ -75,7 +107,7 @@ def init_db():
             issue_checks TEXT,
             semantic_score INTEGER,
             FOREIGN KEY (scan_id) REFERENCES scans (id)
-        );
+        )
     """)
     db.commit()
     cur.close()
@@ -174,7 +206,7 @@ def scan():
         (jd_file.filename, jd_role, json.dumps(keywords), len(candidates), avg_score,
          datetime.utcnow().isoformat()),
     )
-    scan_id = cur.fetchone()["id"]
+    scan_id = cur.fetchone()[0]
 
     for c in candidates:
         cur.execute(
@@ -182,12 +214,12 @@ def scan():
             "section_scores, matched_keywords, missing_keywords, matched_skills, missing_skills, "
             "extra_skills, reasons, file_data, suggestions, passed_checks, warning_checks, "
             "issue_checks, semantic_score) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (scan_id, c["filename"], c["name"], c["email"], c["phone"], c["score"], c["grade"],
              c["status"], json.dumps(c["section_scores"]), json.dumps(c["matched_keywords"]),
              json.dumps(c["missing_keywords"]), json.dumps(c["matched_skills"]),
              json.dumps(c["missing_skills"]), json.dumps(c["extra_skills"]),
-             json.dumps(c["reasons"]), psycopg2.Binary(c["raw"]),
+             json.dumps(c["reasons"]), c["raw"],
              json.dumps(c["suggestions"]), json.dumps(c["passed_checks"]),
              json.dumps(c["warning_checks"]), json.dumps(c["issue_checks"]),
              c["semantic_score"]),
@@ -202,8 +234,8 @@ def scan():
 def results(scan_id):
     db = get_db()
     cur = db.cursor()
-    cur.execute("SELECT * FROM scans WHERE id = %s", (scan_id,))
-    scan_row = cur.fetchone()
+    cur.execute("SELECT id, jd_filename, jd_role, keywords, resume_count, avg_score, created_at FROM scans WHERE id = %s", (scan_id,))
+    scan_row = fetchone_dict(cur)
     if not scan_row:
         flash("Scan not found.")
         return redirect(url_for("index"))
@@ -214,22 +246,18 @@ def results(scan_id):
         "WHERE scan_id = %s ORDER BY score DESC",
         (scan_id,),
     )
-    candidate_rows = cur.fetchall()
+    candidate_rows = fetchall_dict(cur)
     cur.close()
 
     candidates = []
-    for row in candidate_rows:
-        c = dict(row)
+    for c in candidate_rows:
         c["section_scores"] = json.loads(c["section_scores"])
         c["matched_skills"] = json.loads(c["matched_skills"])
         c["missing_skills"] = json.loads(c["missing_skills"])
         candidates.append(c)
 
     keywords = json.loads(scan_row["keywords"])
-
-    return render_template(
-        "results.html", scan=scan_row, candidates=candidates, keywords=keywords
-    )
+    return render_template("results.html", scan=scan_row, candidates=candidates, keywords=keywords)
 
 
 @app.route("/candidate/<int:candidate_id>")
@@ -243,12 +271,12 @@ def candidate_detail(candidate_id):
         "semantic_score, (file_data IS NOT NULL) AS has_file FROM candidates WHERE id = %s",
         (candidate_id,),
     )
-    row = cur.fetchone()
+    row = fetchone_dict(cur)
     if not row:
         flash("Candidate not found.")
         return redirect(url_for("index"))
 
-    candidate = dict(row)
+    candidate = row
     candidate["section_scores"] = json.loads(candidate["section_scores"])
     candidate["matched_keywords"] = json.loads(candidate["matched_keywords"])
     candidate["missing_keywords"] = json.loads(candidate["missing_keywords"])
@@ -261,8 +289,8 @@ def candidate_detail(candidate_id):
     candidate["warning_checks"] = json.loads(candidate["warning_checks"]) if candidate["warning_checks"] else []
     candidate["issue_checks"] = json.loads(candidate["issue_checks"]) if candidate["issue_checks"] else []
 
-    cur.execute("SELECT * FROM scans WHERE id = %s", (candidate["scan_id"],))
-    scan_row = cur.fetchone()
+    cur.execute("SELECT id, jd_filename, jd_role, keywords, resume_count, avg_score, created_at FROM scans WHERE id = %s", (candidate["scan_id"],))
+    scan_row = fetchone_dict(cur)
     cur.close()
 
     return render_template("candidate.html", candidate=candidate, scan=scan_row)
@@ -272,7 +300,7 @@ def _send_resume(candidate_id, as_attachment):
     db = get_db()
     cur = db.cursor()
     cur.execute("SELECT filename, file_data FROM candidates WHERE id = %s", (candidate_id,))
-    row = cur.fetchone()
+    row = fetchone_dict(cur)
     cur.close()
     if not row or row["file_data"] is None:
         abort(404)
@@ -300,8 +328,8 @@ def candidate_download_file(candidate_id):
 def history():
     db = get_db()
     cur = db.cursor()
-    cur.execute("SELECT * FROM scans ORDER BY created_at DESC")
-    scans = cur.fetchall()
+    cur.execute("SELECT id, jd_filename, jd_role, keywords, resume_count, avg_score, created_at FROM scans ORDER BY created_at DESC")
+    scans = fetchall_dict(cur)
     cur.close()
     return render_template("history.html", scans=scans)
 
@@ -322,11 +350,10 @@ def delete_scan(scan_id):
 def dashboard():
     db = get_db()
     cur = db.cursor()
-    cur.execute("SELECT * FROM scans")
-    scans = cur.fetchall()
+    cur.execute("SELECT id, jd_filename, jd_role, keywords, resume_count, avg_score, created_at FROM scans")
+    scans = fetchall_dict(cur)
     cur.execute("SELECT id, scan_id, filename, name, score, grade, status FROM candidates")
-    candidates = cur.fetchall()
-    cur.close()
+    candidates = fetchall_dict(cur)
 
     total_resumes = len(candidates)
     total_scans = len(scans)
@@ -336,40 +363,27 @@ def dashboard():
     buckets = {"0-39": 0, "40-59": 0, "60-79": 0, "80-100": 0}
     for c in candidates:
         s = c["score"]
-        if s < 40:
-            buckets["0-39"] += 1
-        elif s < 60:
-            buckets["40-59"] += 1
-        elif s < 80:
-            buckets["60-79"] += 1
-        else:
-            buckets["80-100"] += 1
+        if s < 40: buckets["0-39"] += 1
+        elif s < 60: buckets["40-59"] += 1
+        elif s < 80: buckets["60-79"] += 1
+        else: buckets["80-100"] += 1
 
     grade_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
     for c in candidates:
         grade_counts[c["grade"]] = grade_counts.get(c["grade"], 0) + 1
 
-    db2 = get_db()
-    cur2 = db2.cursor()
-    cur2.execute(
-        "SELECT id, scan_id, filename, name, score, grade, status FROM candidates "
-        "ORDER BY score DESC LIMIT 8"
-    )
-    top_candidates = cur2.fetchall()
-    cur2.execute("SELECT * FROM scans ORDER BY created_at DESC LIMIT 5")
-    recent_scans = cur2.fetchall()
-    cur2.close()
+    cur.execute("SELECT id, scan_id, filename, name, score, grade, status FROM candidates ORDER BY score DESC LIMIT 8")
+    top_candidates = fetchall_dict(cur)
+    cur.execute("SELECT id, jd_filename, jd_role, keywords, resume_count, avg_score, created_at FROM scans ORDER BY created_at DESC LIMIT 5")
+    recent_scans = fetchall_dict(cur)
+    cur.close()
 
     return render_template(
         "dashboard.html",
-        total_resumes=total_resumes,
-        total_scans=total_scans,
-        shortlisted=shortlisted,
-        avg_score=avg_score,
-        buckets=buckets,
-        grade_counts=grade_counts,
-        top_candidates=top_candidates,
-        recent_scans=recent_scans,
+        total_resumes=total_resumes, total_scans=total_scans,
+        shortlisted=shortlisted, avg_score=avg_score,
+        buckets=buckets, grade_counts=grade_counts,
+        top_candidates=top_candidates, recent_scans=recent_scans,
     )
 
 
