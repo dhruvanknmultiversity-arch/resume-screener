@@ -1,0 +1,127 @@
+{% extends 'base.html' %}
+{% set active = 'bulk' %}
+{% block title %}Bulk Screener{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">P&amp;C Toolkit</div>
+    <h1>Bulk Resume Screener</h1>
+    <p class="lede">Upload one job description and any number of resumes (PDF, DOCX, TXT, or a ZIP).
+      Screen Genie parses every file, extracts contact details, and ranks every candidate by
+      semantic match + keyword coverage against the JD — works for any domain.</p>
+  </div>
+  <div class="head-stats">
+    <div class="stat-mini"><span>JD</span> any format</div>
+    <div class="stat-mini"><span>Batch</span> up to 200</div>
+    <div class="stat-mini"><span>Engine</span> TF-IDF + KW</div>
+  </div>
+</div>
+
+<form class="screen-form" action="{{ url_for('scan') }}" method="post" enctype="multipart/form-data">
+  <div class="grid-2">
+    <div class="card upload">
+      <div class="card-head">
+        <div class="card-title">① Job Description</div>
+        <div class="card-sub">PDF · DOCX · TXT</div>
+      </div>
+      <label class="drop" id="jd-drop">
+        <input type="file" name="jd_file" id="jd-file" accept=".pdf,.docx,.txt" required>
+        <div class="drop-ico">📄</div>
+        <div class="drop-title">Drop the JD here</div>
+        <div class="drop-sub">or click to browse</div>
+        <div class="drop-chip" id="jd-chip"></div>
+      </label>
+    </div>
+
+    <div class="card upload">
+      <div class="card-head">
+        <div class="card-title">② Candidate Resumes</div>
+        <div class="seg">
+          <button type="button" class="seg-btn active" data-mode="files">Files</button>
+          <button type="button" class="seg-btn" data-mode="zip">ZIP</button>
+        </div>
+      </div>
+
+      <input type="hidden" name="resume_mode" id="resume_mode" value="files">
+
+      <label class="drop" id="files-drop">
+        <input type="file" name="resume_files" id="resume-files" accept=".pdf,.docx,.txt" multiple>
+        <div class="drop-ico">📎</div>
+        <div class="drop-title">Drop multiple resumes</div>
+        <div class="drop-sub">PDF / DOCX / TXT · up to 200</div>
+        <div class="drop-list" id="files-list"></div>
+      </label>
+
+      <label class="drop hidden" id="zip-drop">
+        <input type="file" name="resume_zip" id="resume-zip" accept=".zip">
+        <div class="drop-ico">🗂️</div>
+        <div class="drop-title">Drop a ZIP of resumes</div>
+        <div class="drop-sub">Folder of PDF / DOCX / TXT files</div>
+        <div class="drop-chip" id="zip-chip"></div>
+      </label>
+    </div>
+  </div>
+
+  <button type="submit" class="primary-btn" id="run-btn">⚡ Screen Resumes</button>
+</form>
+
+<div class="info-row">
+  <div class="info-card">
+    <div class="info-ico g1">🎯</div>
+    <div><strong>Domain-agnostic scoring</strong><p>Keywords are auto-extracted from your JD — no manual tagging.</p></div>
+  </div>
+  <div class="info-card">
+    <div class="info-ico g2">🧑‍💼</div>
+    <div><strong>Auto-extracted profile</strong><p>Name, email and phone parsed from each resume.</p></div>
+  </div>
+  <div class="info-card">
+    <div class="info-ico g3">📈</div>
+    <div><strong>Recruiter-ready board</strong><p>Ranked list with grade, status, matched / missing keywords.</p></div>
+  </div>
+</div>
+
+<script>
+const segBtns = document.querySelectorAll('.seg-btn');
+const filesDrop = document.getElementById('files-drop');
+const zipDrop = document.getElementById('zip-drop');
+const modeInput = document.getElementById('resume_mode');
+const filesInput = document.getElementById('resume-files');
+const zipInput = document.getElementById('resume-zip');
+
+segBtns.forEach(b => b.addEventListener('click', () => {
+  segBtns.forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  const mode = b.dataset.mode;
+  modeInput.value = mode;
+  if (mode === 'files') {
+    filesDrop.classList.remove('hidden'); zipDrop.classList.add('hidden');
+    zipInput.value = '';
+  } else {
+    zipDrop.classList.remove('hidden'); filesDrop.classList.add('hidden');
+    filesInput.value = '';
+  }
+}));
+
+document.getElementById('jd-file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  document.getElementById('jd-chip').textContent = f ? '📄 ' + f.name : '';
+});
+filesInput.addEventListener('change', e => {
+  const list = document.getElementById('files-list');
+  list.innerHTML = '';
+  Array.from(e.target.files).slice(0, 50).forEach(f => {
+    const d = document.createElement('div'); d.className='file-pill'; d.textContent = f.name;
+    list.appendChild(d);
+  });
+  if (e.target.files.length > 50) {
+    const d = document.createElement('div'); d.className='file-pill more';
+    d.textContent = '+' + (e.target.files.length - 50) + ' more';
+    list.appendChild(d);
+  }
+});
+zipInput.addEventListener('change', e => {
+  const f = e.target.files[0];
+  document.getElementById('zip-chip').textContent = f ? '🗂️ ' + f.name : '';
+});
+</script>
+{% endblock %}
