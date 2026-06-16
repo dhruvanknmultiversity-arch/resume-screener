@@ -1,10 +1,11 @@
 import os
 import io
-import sqlite3
 import json
 import mimetypes
 from datetime import datetime
 
+import psycopg2
+import psycopg2.extras
 from flask import Flask, render_template, request, redirect, url_for, g, flash, send_file, abort
 
 from parsing import (
@@ -16,18 +17,16 @@ from parsing import (
     status_for_score,
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "screengenie.db")
-
 app = Flask(__name__)
-app.secret_key = "screen-genie-internal-dev-key"
+app.secret_key = os.environ.get("SECRET_KEY", "screen-genie-internal-dev-key")
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024  # 60 MB
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return g.db
 
 
@@ -39,11 +38,11 @@ def close_db(exception=None):
 
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.executescript(
-        """
+    db = psycopg2.connect(DATABASE_URL)
+    cur = db.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS scans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             jd_filename TEXT NOT NULL,
             jd_role TEXT,
             keywords TEXT,
@@ -53,7 +52,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS candidates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             scan_id INTEGER NOT NULL,
             filename TEXT NOT NULL,
             name TEXT,
@@ -69,7 +68,7 @@ def init_db():
             missing_skills TEXT,
             extra_skills TEXT,
             reasons TEXT,
-            file_data BLOB,
+            file_data BYTEA,
             suggestions TEXT,
             passed_checks TEXT,
             warning_checks TEXT,
@@ -77,9 +76,9 @@ def init_db():
             semantic_score INTEGER,
             FOREIGN KEY (scan_id) REFERENCES scans (id)
         );
-        """
-    )
+    """)
     db.commit()
+    cur.close()
     db.close()
 
 
@@ -110,7 +109,7 @@ def scan():
         flash("Could not read text from the job description file.")
         return redirect(url_for("index"))
 
-    resume_docs = []  # list of (filename, text, raw_bytes)
+    resume_docs = []
 
     if resume_mode == "zip":
         zip_file = request.files.get("resume_zip")
@@ -168,31 +167,33 @@ def scan():
     avg_score = round(sum(c["score"] for c in candidates) / len(candidates), 1)
 
     db = get_db()
-    cur = db.execute(
+    cur = db.cursor()
+    cur.execute(
         "INSERT INTO scans (jd_filename, jd_role, keywords, resume_count, avg_score, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
         (jd_file.filename, jd_role, json.dumps(keywords), len(candidates), avg_score,
          datetime.utcnow().isoformat()),
     )
-    scan_id = cur.lastrowid
+    scan_id = cur.fetchone()["id"]
 
     for c in candidates:
-        db.execute(
+        cur.execute(
             "INSERT INTO candidates (scan_id, filename, name, email, phone, score, grade, status, "
             "section_scores, matched_keywords, missing_keywords, matched_skills, missing_skills, "
             "extra_skills, reasons, file_data, suggestions, passed_checks, warning_checks, "
             "issue_checks, semantic_score) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (scan_id, c["filename"], c["name"], c["email"], c["phone"], c["score"], c["grade"],
              c["status"], json.dumps(c["section_scores"]), json.dumps(c["matched_keywords"]),
              json.dumps(c["missing_keywords"]), json.dumps(c["matched_skills"]),
              json.dumps(c["missing_skills"]), json.dumps(c["extra_skills"]),
-             json.dumps(c["reasons"]), c["raw"],
+             json.dumps(c["reasons"]), psycopg2.Binary(c["raw"]),
              json.dumps(c["suggestions"]), json.dumps(c["passed_checks"]),
              json.dumps(c["warning_checks"]), json.dumps(c["issue_checks"]),
              c["semantic_score"]),
         )
     db.commit()
+    cur.close()
 
     return redirect(url_for("results", scan_id=scan_id))
 
@@ -200,17 +201,21 @@ def scan():
 @app.route("/results/<int:scan_id>")
 def results(scan_id):
     db = get_db()
-    scan_row = db.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
+    cur = db.cursor()
+    cur.execute("SELECT * FROM scans WHERE id = %s", (scan_id,))
+    scan_row = cur.fetchone()
     if not scan_row:
         flash("Scan not found.")
         return redirect(url_for("index"))
 
-    candidate_rows = db.execute(
+    cur.execute(
         "SELECT id, scan_id, filename, name, email, phone, score, grade, status, "
         "section_scores, matched_skills, missing_skills FROM candidates "
-        "WHERE scan_id = ? ORDER BY score DESC",
+        "WHERE scan_id = %s ORDER BY score DESC",
         (scan_id,),
-    ).fetchall()
+    )
+    candidate_rows = cur.fetchall()
+    cur.close()
 
     candidates = []
     for row in candidate_rows:
@@ -230,13 +235,15 @@ def results(scan_id):
 @app.route("/candidate/<int:candidate_id>")
 def candidate_detail(candidate_id):
     db = get_db()
-    row = db.execute(
+    cur = db.cursor()
+    cur.execute(
         "SELECT id, scan_id, filename, name, email, phone, score, grade, status, "
         "section_scores, matched_keywords, missing_keywords, matched_skills, missing_skills, "
         "extra_skills, reasons, suggestions, passed_checks, warning_checks, issue_checks, "
-        "semantic_score, (file_data IS NOT NULL) AS has_file FROM candidates WHERE id = ?",
+        "semantic_score, (file_data IS NOT NULL) AS has_file FROM candidates WHERE id = %s",
         (candidate_id,),
-    ).fetchone()
+    )
+    row = cur.fetchone()
     if not row:
         flash("Candidate not found.")
         return redirect(url_for("index"))
@@ -254,21 +261,25 @@ def candidate_detail(candidate_id):
     candidate["warning_checks"] = json.loads(candidate["warning_checks"]) if candidate["warning_checks"] else []
     candidate["issue_checks"] = json.loads(candidate["issue_checks"]) if candidate["issue_checks"] else []
 
-    scan_row = db.execute("SELECT * FROM scans WHERE id = ?", (candidate["scan_id"],)).fetchone()
+    cur.execute("SELECT * FROM scans WHERE id = %s", (candidate["scan_id"],))
+    scan_row = cur.fetchone()
+    cur.close()
 
     return render_template("candidate.html", candidate=candidate, scan=scan_row)
 
 
 def _send_resume(candidate_id, as_attachment):
     db = get_db()
-    row = db.execute(
-        "SELECT filename, file_data FROM candidates WHERE id = ?", (candidate_id,)
-    ).fetchone()
+    cur = db.cursor()
+    cur.execute("SELECT filename, file_data FROM candidates WHERE id = %s", (candidate_id,))
+    row = cur.fetchone()
+    cur.close()
     if not row or row["file_data"] is None:
         abort(404)
     mimetype, _ = mimetypes.guess_type(row["filename"])
+    file_bytes = bytes(row["file_data"])
     return send_file(
-        io.BytesIO(row["file_data"]),
+        io.BytesIO(file_bytes),
         mimetype=mimetype or "application/octet-stream",
         as_attachment=as_attachment,
         download_name=row["filename"],
@@ -288,16 +299,21 @@ def candidate_download_file(candidate_id):
 @app.route("/history")
 def history():
     db = get_db()
-    scans = db.execute("SELECT * FROM scans ORDER BY created_at DESC").fetchall()
+    cur = db.cursor()
+    cur.execute("SELECT * FROM scans ORDER BY created_at DESC")
+    scans = cur.fetchall()
+    cur.close()
     return render_template("history.html", scans=scans)
 
 
 @app.route("/history/<int:scan_id>/delete", methods=["POST"])
 def delete_scan(scan_id):
     db = get_db()
-    db.execute("DELETE FROM candidates WHERE scan_id = ?", (scan_id,))
-    db.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
+    cur = db.cursor()
+    cur.execute("DELETE FROM candidates WHERE scan_id = %s", (scan_id,))
+    cur.execute("DELETE FROM scans WHERE id = %s", (scan_id,))
     db.commit()
+    cur.close()
     flash("Scan deleted.")
     return redirect(url_for("history"))
 
@@ -305,10 +321,12 @@ def delete_scan(scan_id):
 @app.route("/dashboard")
 def dashboard():
     db = get_db()
-    scans = db.execute("SELECT * FROM scans").fetchall()
-    candidates = db.execute(
-        "SELECT id, scan_id, filename, name, score, grade, status FROM candidates"
-    ).fetchall()
+    cur = db.cursor()
+    cur.execute("SELECT * FROM scans")
+    scans = cur.fetchall()
+    cur.execute("SELECT id, scan_id, filename, name, score, grade, status FROM candidates")
+    candidates = cur.fetchall()
+    cur.close()
 
     total_resumes = len(candidates)
     total_scans = len(scans)
@@ -331,14 +349,16 @@ def dashboard():
     for c in candidates:
         grade_counts[c["grade"]] = grade_counts.get(c["grade"], 0) + 1
 
-    top_candidates = db.execute(
+    db2 = get_db()
+    cur2 = db2.cursor()
+    cur2.execute(
         "SELECT id, scan_id, filename, name, score, grade, status FROM candidates "
         "ORDER BY score DESC LIMIT 8"
-    ).fetchall()
-
-    recent_scans = db.execute(
-        "SELECT * FROM scans ORDER BY created_at DESC LIMIT 5"
-    ).fetchall()
+    )
+    top_candidates = cur2.fetchall()
+    cur2.execute("SELECT * FROM scans ORDER BY created_at DESC LIMIT 5")
+    recent_scans = cur2.fetchall()
+    cur2.close()
 
     return render_template(
         "dashboard.html",
