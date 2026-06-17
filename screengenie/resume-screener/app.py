@@ -25,13 +25,36 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
 def parse_db_url(url):
-    r = urlparse(url)
+    # urlparse misreads dotted usernames like postgres.xxxx in Supabase URLs.
+    # Manually extract user:password@host:port/db from the URL.
+    url = url.strip()
+    # strip scheme
+    rest = url.split("://", 1)[1]
+    # split userinfo from hostinfo
+    at_idx = rest.rfind("@")
+    userinfo = rest[:at_idx]
+    hostinfo = rest[at_idx + 1:]
+    # split user:password
+    if ":" in userinfo:
+        user, password = userinfo.split(":", 1)
+    else:
+        user, password = userinfo, ""
+    # split host:port/db
+    if "/" in hostinfo:
+        hostport, database = hostinfo.split("/", 1)
+    else:
+        hostport, database = hostinfo, ""
+    if ":" in hostport:
+        host, port = hostport.rsplit(":", 1)
+        port = int(port)
+    else:
+        host, port = hostport, 5432
     return {
-        "host": r.hostname,
-        "port": r.port or 5432,
-        "database": r.path.lstrip("/"),
-        "user": r.username,
-        "password": r.password,
+        "host": host,
+        "port": port,
+        "database": database.split("?")[0],
+        "user": user,
+        "password": password,
     }
 
 
