@@ -21,7 +21,9 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "screen-genie-internal-dev-key")
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024  # 60 MB
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+# Read at request time so Railway's env vars are always picked up
+def get_database_url():
+    return os.environ.get("DATABASE_URL", "")
 
 
 def parse_db_url(url):
@@ -60,7 +62,10 @@ def parse_db_url(url):
 
 def get_db():
     if "db" not in g:
-        p = parse_db_url(DATABASE_URL)
+        url = get_database_url()
+        if not url or "://" not in url:
+            raise RuntimeError(f"DATABASE_URL not set or invalid: '{url}'")
+        p = parse_db_url(url)
         g.db = pg8000.dbapi.connect(
             host=p["host"], port=p["port"], database=p["database"],
             user=p["user"], password=p["password"], ssl_context=True,
@@ -88,7 +93,7 @@ def close_db(exception=None):
 
 
 def init_db():
-    p = parse_db_url(DATABASE_URL)
+    p = parse_db_url(get_database_url())
     db = pg8000.dbapi.connect(
         host=p["host"], port=p["port"], database=p["database"],
         user=p["user"], password=p["password"], ssl_context=True,
