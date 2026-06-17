@@ -22,30 +22,21 @@ app.secret_key = os.environ.get("SECRET_KEY", "screen-genie-internal-dev-key")
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024  # 60 MB
 
 # Read at request time so Railway's env vars are always picked up
-@app.route("/healthz")
-def healthz():
-    url = get_database_url()
-    has_url = bool(url and "://" in url)
-    env_keys = [k for k in os.environ if "DATABASE" in k or "POSTGRES" in k or "PG" in k]
-    return {"status": "ok", "has_db_url": has_url, "db_env_keys": env_keys}
+def get_database_url():
+    url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or os.environ.get("DATABASE_PRIVATE_URL") or ""
+    return url
 
 
 def parse_db_url(url):
-    # urlparse misreads dotted usernames like postgres.xxxx in Supabase URLs.
-    # Manually extract user:password@host:port/db from the URL.
     url = url.strip()
-    # strip scheme
     rest = url.split("://", 1)[1]
-    # split userinfo from hostinfo
     at_idx = rest.rfind("@")
     userinfo = rest[:at_idx]
     hostinfo = rest[at_idx + 1:]
-    # split user:password
     if ":" in userinfo:
         user, password = userinfo.split(":", 1)
     else:
         user, password = userinfo, ""
-    # split host:port/db
     if "/" in hostinfo:
         hostport, database = hostinfo.split("/", 1)
     else:
@@ -152,6 +143,14 @@ def guess_role(jd_text, jd_filename):
         if line:
             return line[:80]
     return jd_filename
+
+
+@app.route("/healthz")
+def healthz():
+    url = get_database_url()
+    has_url = bool(url and "://" in url)
+    env_keys = [k for k in os.environ if "DATABASE" in k or "POSTGRES" in k or "PG" in k]
+    return {"status": "ok", "has_db_url": has_url, "db_env_keys": env_keys}
 
 
 @app.route("/")
